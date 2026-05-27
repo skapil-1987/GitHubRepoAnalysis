@@ -37,12 +37,15 @@ public class OpenAIService : IOpenAIService
         var apiVersion = _configuration["AzureOpenAI:ApiVersion"] ?? "2024-10-21";
 
         if (string.IsNullOrWhiteSpace(endpoint) ||
-            string.IsNullOrWhiteSpace(apiKey) ||
-            string.IsNullOrWhiteSpace(deployment))
+            string.IsNullOrWhiteSpace(apiKey))
         {
             _logger.LogInformation("Azure OpenAI not configured; skipping batch AI insights.");
             return empty;
         }
+
+        // Deployment is optional — if empty, assumes Foundry serverless (Models-as-a-Service)
+        if (string.IsNullOrWhiteSpace(deployment))
+            _logger.LogInformation("No deployment name configured; using Foundry serverless endpoint.");
 
         var prompt = BuildBatchPrompt(repos);
 
@@ -58,7 +61,23 @@ public class OpenAIService : IOpenAIService
         };
 
         var client = _httpClientFactory.CreateClient(HttpClientName);
-        var url = $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
+
+        // CHANGED: Azure AI Foundry (.services.ai.azure.com) uses a different URL format
+        // than classic Azure OpenAI (.openai.azure.com).
+        // Foundry (AI Services): {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...
+        // Classic Azure OpenAI:  {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...
+        // Foundry serverless (Models-as-a-Service): {endpoint}/models/chat/completions?api-version=2024-05-01-preview
+        var trimmedEndpoint = endpoint.TrimEnd('/');
+        string url;
+        if (string.IsNullOrWhiteSpace(deployment))
+        {
+            // Serverless / Models-as-a-Service — no deployment name needed
+            url = $"{trimmedEndpoint}/models/chat/completions?api-version={apiVersion}";
+        }
+        else
+        {
+            url = $"{trimmedEndpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
+        }
 
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
