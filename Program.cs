@@ -36,6 +36,8 @@ builder.Services.AddHttpClient(OpenAIService.HttpClientName);
 
 builder.Services.AddSingleton<IGitHubService, GitHubService>();
 builder.Services.AddSingleton<IOpenAIService, OpenAIService>();
+builder.Services.AddSingleton<ICompletenessScoreService, CompletenessScoreService>();
+builder.Services.AddSingleton<ICodeMetricsService, CodeMetricsService>();
 builder.Services.AddSingleton<IAnalysisService, AnalysisService>();
 
 builder.Build().Run();

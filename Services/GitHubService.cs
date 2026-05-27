@@ -15,6 +15,10 @@ public class GitHubService : IGitHubService
         @"github\.com[:/](?<owner>[^/]+)/(?<repo>[^/\s\.]+)(\.git)?/?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex ProfileUrlRegex = new(
+        @"github\.com/(?<username>[^/\s]+)/?$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GitHubService> _logger;
 
@@ -22,6 +26,18 @@ public class GitHubService : IGitHubService
     {
         _httpClientFactory = httpClientFactory;
         _logger = logger;
+    }
+
+    public string ParseProfileUrl(string profileUrl)
+    {
+        if (string.IsNullOrWhiteSpace(profileUrl))
+            throw new ArgumentException("GitHub profile URL is required.", nameof(profileUrl));
+
+        var match = ProfileUrlRegex.Match(profileUrl);
+        if (!match.Success)
+            throw new ArgumentException($"Invalid GitHub profile URL: {profileUrl}", nameof(profileUrl));
+
+        return match.Groups["username"].Value;
     }
 
     public (string Owner, string Repo) ParseRepoUrl(string url)
@@ -38,6 +54,9 @@ public class GitHubService : IGitHubService
 
     public async Task<GitHubRepo?> GetRepositoryAsync(string owner, string repo, CancellationToken ct = default)
         => await GetJsonAsync<GitHubRepo>($"/repos/{owner}/{repo}", ct);
+
+    public async Task<GitHubUser?> GetUserProfileAsync(string username, CancellationToken ct = default)
+        => await GetJsonAsync<GitHubUser>($"/users/{username}", ct);
 
     public async Task<Dictionary<string, long>> GetLanguagesAsync(string owner, string repo, CancellationToken ct = default)
         => await GetJsonAsync<Dictionary<string, long>>($"/repos/{owner}/{repo}/languages", ct) ?? new();
@@ -73,6 +92,46 @@ public class GitHubService : IGitHubService
     public async Task<List<GitHubContentItem>> GetRootContentsAsync(string owner, string repo, CancellationToken ct = default)
         => await GetJsonAsync<List<GitHubContentItem>>($"/repos/{owner}/{repo}/contents", ct) ?? new();
 
+    public async Task<GitHubTreeResponse?> GetFileTreeAsync(string owner, string repo, string branch, CancellationToken ct = default)
+        => await GetJsonAsync<GitHubTreeResponse>($"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", ct);
+
+    public async Task<GitHubReadme?> GetReadmeInfoAsync(string owner, string repo, CancellationToken ct = default)
+        => await GetJsonAsync<GitHubReadme>($"/repos/{owner}/{repo}/readme", ct);
+
+    public async Task<int> GetBranchCountAsync(string owner, string repo, CancellationToken ct = default)
+        => await GetAllPagesCountAsync<GitHubBranch>($"/repos/{owner}/{repo}/branches", ct);
+
+    public async Task<int> GetPullRequestCountAsync(string owner, string repo, CancellationToken ct = default)
+        => await GetAllPagesCountAsync<GitHubPullRequest>($"/repos/{owner}/{repo}/pulls?state=all", ct);
+
+    public async Task<int> GetReleaseCountAsync(string owner, string repo, CancellationToken ct = default)
+        => await GetAllPagesCountAsync<GitHubRelease>($"/repos/{owner}/{repo}/releases", ct);
+
+    public async Task<List<GitHubRepo>> GetUserRepositoriesAsync(string username, CancellationToken ct = default)
+    {
+        var allRepos = new List<GitHubRepo>();
+        var page = 1;
+
+        while (true)
+        {
+            var pageRepos = await GetJsonAsync<List<GitHubRepo>>(
+                $"/users/{username}/repos?per_page=100&page={page}&type=public", ct);
+
+            if (pageRepos is null || pageRepos.Count == 0)
+                break;
+
+            allRepos.AddRange(pageRepos);
+
+            if (pageRepos.Count < 100)
+                break;
+
+            page++;
+        }
+
+        _logger.LogInformation("Fetched {Count} public repositories for user {Username}", allRepos.Count, username);
+        return allRepos;
+    }
+
     public async Task<string?> GetFileContentAsync(string owner, string repo, string path, CancellationToken ct = default)
     {
         var client = _httpClientFactory.CreateClient(HttpClientName);
@@ -96,6 +155,24 @@ public class GitHubService : IGitHubService
         }
     }
 
+    private async Task<int> GetAllPagesCountAsync<T>(string basePath, CancellationToken ct)
+    {
+        var count = 0;
+        var page = 1;
+        var separator = basePath.Contains('?') ? "&" : "?";
+
+        while (true)
+        {
+            var items = await GetJsonAsync<List<T>>($"{basePath}{separator}per_page=100&page={page}", ct);
+            if (items is null || items.Count == 0) break;
+            count += items.Count;
+            if (items.Count < 100) break;
+            page++;
+        }
+
+        return count;
+    }
+
     private async Task<T?> GetJsonAsync<T>(string path, CancellationToken ct)
     {
         var client = _httpClientFactory.CreateClient(HttpClientName);
@@ -115,5 +192,65 @@ public class GitHubService : IGitHubService
             _logger.LogError(ex, "GitHub API call failed for {Path}", path);
             throw;
         }
+    }
+
+    private static readonly HashSet<string> CodeExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".cs", ".py", ".js", ".ts", ".java", ".cpp", ".html", ".css"
+    };
+
+    private static readonly string[] ExcludedPrefixes =
+    {
+        "node_modules/", "bin/", "obj/", ".git/"
+    };
+
+    public async Task<List<(string Path, string Content)>> GetCodeFilesAsync(
+        string owner, string repo, string branch, CancellationToken ct = default)
+    {
+        const int maxFiles        = 10;
+        const int maxLinesPerFile = 250;
+
+        var result = new List<(string, string)>();
+
+        try
+        {
+            var tree = await GetFileTreeAsync(owner, repo, branch, ct);
+            if (tree is null) return result;
+
+            var candidates = tree.Tree
+                .Where(item =>
+                    item.Type == "blob" &&
+                    CodeExtensions.Contains(Path.GetExtension(item.Path)) &&
+                    !ExcludedPrefixes.Any(p => item.Path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                .Take(maxFiles)
+                .ToList();
+
+            foreach (var item in candidates)
+            {
+                try
+                {
+                    var rawUrl = $"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{item.Path}";
+                    var client = _httpClientFactory.CreateClient(HttpClientName);
+                    var content = await client.GetStringAsync(rawUrl, ct);
+
+                    // Truncate to max lines
+                    var lines = content.Split('\n');
+                    if (lines.Length > maxLinesPerFile)
+                        content = string.Join('\n', lines.Take(maxLinesPerFile));
+
+                    result.Add((item.Path, content));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Could not fetch content for {Path}", item.Path);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "GetCodeFilesAsync failed for {Owner}/{Repo}", owner, repo);
+        }
+
+        return result;
     }
 }

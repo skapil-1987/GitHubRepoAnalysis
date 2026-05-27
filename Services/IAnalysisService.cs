@@ -4,5 +4,5 @@ namespace GithubRepoAnalysis.Services;
 
 public interface IAnalysisService
 {
-    Task<AnalyzeResponse> AnalyzeAsync(AnalyzeRequest request, CancellationToken ct = default);
+    Task<AnalyzeUserResponse> AnalyzeUserAsync(AnalyzeUserRequest request, CancellationToken ct = default);
 }

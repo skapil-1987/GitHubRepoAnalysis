@@ -22,17 +22,17 @@ public class AnalyzeRepoFunction
         _logger = logger;
     }
 
-    [Function("AnalyzeRepo")]
-    public async Task<IActionResult> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "analyze")] HttpRequest req,
+    [Function("AnalyzeUser")]
+    public async Task<IActionResult> RunUser(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "analyze-user")] HttpRequest req,
         CancellationToken cancellationToken)
     {
-        _logger.LogInformation("AnalyzeRepo function invoked.");
+        _logger.LogInformation("AnalyzeUser function invoked.");
 
-        AnalyzeRequest? request;
+        AnalyzeUserRequest? request;
         try
         {
-            request = await JsonSerializer.DeserializeAsync<AnalyzeRequest>(
+            request = await JsonSerializer.DeserializeAsync<AnalyzeUserRequest>(
                 req.Body, JsonOptions, cancellationToken);
         }
         catch (JsonException ex)
@@ -42,23 +42,19 @@ public class AnalyzeRepoFunction
         }
 
         if (request is null ||
-            string.IsNullOrWhiteSpace(request.GithubRepoUrl) ||
+            string.IsNullOrWhiteSpace(request.GithubProfileUrl) ||
             string.IsNullOrWhiteSpace(request.StudentName))
         {
             return new BadRequestObjectResult(new
             {
-                error = "studentName and githubRepoUrl are required."
+                error = "studentName and githubProfileUrl are required."
             });
         }
 
         try
         {
-            var result = await _analysisService.AnalyzeAsync(request, cancellationToken);
+            var result = await _analysisService.AnalyzeUserAsync(request, cancellationToken);
             return new OkObjectResult(result);
-        }
-        catch (ArgumentException ex)
-        {
-            return new BadRequestObjectResult(new { error = ex.Message });
         }
         catch (InvalidOperationException ex)
         {
@@ -74,7 +70,7 @@ public class AnalyzeRepoFunction
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unhandled error analyzing repository.");
+            _logger.LogError(ex, "Unhandled error analyzing user repositories.");
             return new ObjectResult(new { error = "Internal server error." })
             {
                 StatusCode = (int)HttpStatusCode.InternalServerError

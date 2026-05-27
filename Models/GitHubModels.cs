@@ -21,6 +21,18 @@ public class GitHubRepo
 
     [JsonPropertyName("stargazers_count")]
     public int Stars { get; set; }
+
+    [JsonPropertyName("created_at")]
+    public DateTime CreatedAt { get; set; }
+
+    [JsonPropertyName("updated_at")]
+    public DateTime UpdatedAt { get; set; }
+
+    [JsonPropertyName("pushed_at")]
+    public DateTime PushedAt { get; set; }
+
+    [JsonPropertyName("size")]
+    public int Size { get; set; }
 }
 
 public class GitHubContributor
@@ -78,4 +90,61 @@ public class GitHubContentItem
 
     [JsonPropertyName("type")]
     public string Type { get; set; } = string.Empty;
+}
+
+public class GitHubTreeResponse
+{
+    [JsonPropertyName("tree")]
+    public List<GitHubTreeItem> Tree { get; set; } = new();
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+}
+
+public class GitHubTreeItem
+{
+    [JsonPropertyName("path")]
+    public string Path { get; set; } = string.Empty;
+
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonPropertyName("size")]
+    public int? Size { get; set; }
+}
+
+public class GitHubReadme
+{
+    [JsonPropertyName("size")]
+    public int Size { get; set; }
+}
+
+public class GitHubBranch
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+}
+
+public class GitHubUser
+{
+    [JsonPropertyName("login")]
+    public string Login { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("email")]
+    public string? Email { get; set; }
+}
+
+public class GitHubPullRequest
+{
+    [JsonPropertyName("number")]
+    public int Number { get; set; }
+}
+
+public class GitHubRelease
+{
+    [JsonPropertyName("id")]
+    public int Id { get; set; }
 }

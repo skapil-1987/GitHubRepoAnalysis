@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using GithubRepoAnalysis.Models;
 using Microsoft.Extensions.Logging;
 
@@ -5,28 +6,194 @@ namespace GithubRepoAnalysis.Services;
 
 public class AnalysisService : IAnalysisService
 {
+    private const int MaxConcurrentRepoAnalysis = 5;
+
+    private static readonly HashSet<string> CodeExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".cs", ".js", ".ts", ".py", ".java", ".go", ".rb", ".php",
+        ".cpp", ".c", ".rs", ".kt", ".swift", ".scala", ".r", ".m"
+    };
+
     private readonly IGitHubService _gitHub;
     private readonly IOpenAIService _openAi;
+    private readonly ICompletenessScoreService _completenessScorer;
+    private readonly ICodeMetricsService _codeMetrics;
     private readonly ILogger<AnalysisService> _logger;
 
-    public AnalysisService(IGitHubService gitHub, IOpenAIService openAi, ILogger<AnalysisService> logger)
+    public AnalysisService(
+        IGitHubService gitHub,
+        IOpenAIService openAi,
+        ICompletenessScoreService completenessScorer,
+        ICodeMetricsService codeMetrics,
+        ILogger<AnalysisService> logger)
     {
         _gitHub = gitHub;
         _openAi = openAi;
+        _completenessScorer = completenessScorer;
+        _codeMetrics = codeMetrics;
         _logger = logger;
     }
 
-    public async Task<AnalyzeResponse> AnalyzeAsync(AnalyzeRequest request, CancellationToken ct = default)
+    public async Task<AnalyzeUserResponse> AnalyzeUserAsync(AnalyzeUserRequest request, CancellationToken ct = default)
     {
-        var (owner, repoName) = _gitHub.ParseRepoUrl(request.GithubRepoUrl);
-        _logger.LogInformation("Analyzing repository {Owner}/{Repo} for {Student}", owner, repoName, request.StudentName);
+        var username = _gitHub.ParseProfileUrl(request.GithubProfileUrl);
+        _logger.LogInformation("Fetching all repositories for GitHub user {Username}", username);
+
+        // Fetch user profile once to resolve email for contribution matching
+        var userProfile = await _gitHub.GetUserProfileAsync(username, ct);
+        var resolvedEmail = !string.IsNullOrWhiteSpace(request.Email)
+            ? request.Email
+            : userProfile?.Email ?? string.Empty;
+
+        if (!string.IsNullOrWhiteSpace(resolvedEmail))
+            _logger.LogInformation("Using email {Email} for contribution matching of user {Username}", resolvedEmail, username);
+        else
+            _logger.LogWarning("No email available for user {Username} — contribution matching will use name only", username);
+
+        List<GitHubRepo> repos;
+        try
+        {
+            repos = await _gitHub.GetUserRepositoriesAsync(username, ct);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            throw new InvalidOperationException($"GitHub user '{username}' not found.", ex);
+        }
+
+        if (repos.Count == 0)
+        {
+            _logger.LogWarning("No public repositories found for user {Username}", username);
+            return new AnalyzeUserResponse
+            {
+                StudentName = request.StudentName,
+                GithubUsername = username,
+                TotalRepos = 0
+            };
+        }
+
+        _logger.LogInformation("Analyzing {Count} repositories for user {Username}", repos.Count, username);
+
+        var semaphore = new SemaphoreSlim(MaxConcurrentRepoAnalysis);
+        var results = new ConcurrentBag<AnalyzeResponse>();
+        var failureCount = 0;
+
+        var tasks = repos.Select(async repo =>
+        {
+            await semaphore.WaitAsync(ct);
+            try
+            {
+                // Feature 1: skip repos where latest commit is 1 year or older
+                if (repo.PushedAt < DateTime.UtcNow.AddYears(-1))
+                {
+                    _logger.LogInformation("Skipping stale repository {Username}/{Repo} — last push: {PushedAt:yyyy-MM-dd}",
+                        username, repo.Name, repo.PushedAt);
+                    Interlocked.Increment(ref failureCount);
+                    return;
+                }
+
+                var response = await AnalyzeRepoAsync(username, repo.Name, request.StudentName, resolvedEmail, ct);
+                results.Add(response);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to analyze repository {Username}/{Repo}", username, repo.Name);
+                Interlocked.Increment(ref failureCount);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+
+        var sortedRepos = results.OrderByDescending(r => r.FinalScore).ToList();
+
+        // Collect code metrics for top 3 repos in parallel, then make ONE batch LLM call
+        var top3 = sortedRepos.Take(3).ToList();
+        _logger.LogInformation("Collecting code metrics for top {Count} repositories for user {Username}", top3.Count, username);
+
+        var repoMetricsList = new List<(AnalyzeResponse Summary, CodeMetrics Metrics)>();
+
+        await Task.WhenAll(top3.Select(async repoResponse =>
+        {
+            try
+            {
+                var repoName = repoResponse.Repo.Split('/').Last();
+                var repoInfo = await _gitHub.GetRepositoryAsync(username, repoName, ct);
+                if (repoInfo is null) return;
+
+                var tree      = await _gitHub.GetFileTreeAsync(username, repoName, repoInfo.DefaultBranch, ct);
+                var treeItems = tree?.Tree ?? new List<GitHubTreeItem>();
+                var readme    = await _gitHub.GetReadmeInfoAsync(username, repoName, ct);
+                var codeFiles = await _gitHub.GetCodeFilesAsync(username, repoName, repoInfo.DefaultBranch, ct);
+
+                var metrics = _codeMetrics.ExtractMetrics(
+                    codeFiles,
+                    readmeSize:   readme?.Size ?? 0,
+                    hasStructure: treeItems.Count(t => t.Type == "tree") > 0);
+
+                lock (repoMetricsList)
+                    repoMetricsList.Add((repoResponse, metrics));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Code-metrics collection failed for {Repo}", repoResponse.Repo);
+            }
+        }));
+
+        // Single LLM call — returns codeQualityScore per repo + one aiSummary
+        var aiSummary = string.Empty;
+        if (repoMetricsList.Count > 0)
+        {
+            try
+            {
+                _logger.LogInformation("Making single batch LLM call for {Count} repos", repoMetricsList.Count);
+                var (codeQualityScores, batchSummary) = await _openAi.GetBatchRepoInsightAsync(repoMetricsList, ct);
+
+                // Apply per-repo codeQualityScore from the single response
+                foreach (var (repoResponse, _) in repoMetricsList)
+                {
+                    if (codeQualityScores.TryGetValue(repoResponse.Repo, out var score))
+                        repoResponse.CodeQualityScore = score;
+                }
+
+                aiSummary = batchSummary;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Batch AI call failed; proceeding without AI summary.");
+                aiSummary = "AI analysis unavailable";
+            }
+        }
+
+        return new AnalyzeUserResponse
+        {
+            StudentName    = request.StudentName,
+            GithubUsername = username,
+            TotalRepos     = repos.Count,
+            SuccessCount   = results.Count,
+            FailureCount   = failureCount,
+            AiSummary      = aiSummary,
+            Repositories   = sortedRepos
+        };
+    }
+
+    private async Task<AnalyzeResponse> AnalyzeRepoAsync(
+        string owner,
+        string repoName,
+        string studentName,
+        string email,
+        CancellationToken ct)
+    {
+        _logger.LogInformation("Analyzing repository {Owner}/{Repo} for {Student}", owner, repoName, studentName);
 
         var repo = await _gitHub.GetRepositoryAsync(owner, repoName, ct)
                    ?? throw new InvalidOperationException($"Repository {owner}/{repoName} not found.");
 
         var response = new AnalyzeResponse
         {
-            StudentName = request.StudentName,
+            StudentName = studentName,
             Repo = repo.FullName,
             IsFork = repo.Fork
         };
@@ -38,17 +205,54 @@ public class AnalysisService : IAnalysisService
             return response;
         }
 
-        var languagesTask = _gitHub.GetLanguagesAsync(owner, repoName, ct);
-        var contributorsTask = _gitHub.GetContributorsAsync(owner, repoName, ct);
-        var commitsTask = _gitHub.GetCommitsAsync(owner, repoName, 100, ct);
-        var contentsTask = _gitHub.GetRootContentsAsync(owner, repoName, ct);
+        // Fetch all data in parallel
+        var languagesTask      = _gitHub.GetLanguagesAsync(owner, repoName, ct);
+        var contributorsTask   = _gitHub.GetContributorsAsync(owner, repoName, ct);
+        var commitsTask        = _gitHub.GetCommitsAsync(owner, repoName, 100, ct);
+        var contentsTask       = _gitHub.GetRootContentsAsync(owner, repoName, ct);
+        var treeTask           = _gitHub.GetFileTreeAsync(owner, repo.DefaultBranch, repo.DefaultBranch, ct);
+        var readmeTask         = _gitHub.GetReadmeInfoAsync(owner, repoName, ct);
+        var branchCountTask    = _gitHub.GetBranchCountAsync(owner, repoName, ct);
+        var prCountTask        = _gitHub.GetPullRequestCountAsync(owner, repoName, ct);
+        var releaseCountTask   = _gitHub.GetReleaseCountAsync(owner, repoName, ct);
 
-        await Task.WhenAll(languagesTask, contributorsTask, commitsTask, contentsTask);
+        await Task.WhenAll(
+            languagesTask, contributorsTask, commitsTask, contentsTask,
+            treeTask, readmeTask, branchCountTask, prCountTask, releaseCountTask);
 
-        var languages = languagesTask.Result;
+        var languages    = languagesTask.Result;
         var contributors = contributorsTask.Result;
-        var commits = commitsTask.Result;
+        var commits      = commitsTask.Result;
         var rootContents = contentsTask.Result;
+        var tree         = treeTask.Result;
+        var readme       = readmeTask.Result;
+
+        // Build metrics
+        var treeItems = tree?.Tree ?? new List<GitHubTreeItem>();
+        var metrics = new RepoMetrics
+        {
+            CreatedAt        = repo.CreatedAt,
+            UpdatedAt        = repo.UpdatedAt,
+            PushedAt         = repo.PushedAt,
+            Size             = repo.Size,
+            IsFork           = repo.Fork,
+            TotalCommits     = commits.Count,
+            FileCount        = treeItems.Count(t => t.Type == "blob"),
+            DirectoryCount   = treeItems.Count(t => t.Type == "tree"),
+            CodeFileCount    = treeItems.Count(t => t.Type == "blob" && CodeExtensions.Contains(Path.GetExtension(t.Path))),
+            ReadmeSize       = readme?.Size ?? 0,
+            Languages        = languages.Keys.ToList(),
+            ContributorCount = contributors.Count,
+            BranchCount      = branchCountTask.Result,
+            PullRequestCount = prCountTask.Result,
+            ReleaseCount     = releaseCountTask.Result
+        };
+
+        // Detect frameworks from root contents
+        var frameworks = DetectFrameworks(rootContents);
+
+        // Calculate completeness using rule-based service
+        var (completenessScore, breakdown) = _completenessScorer.CalculateScore(metrics);
 
         response.Languages = languages
             .OrderByDescending(kv => kv.Value)
@@ -56,104 +260,91 @@ public class AnalysisService : IAnalysisService
             .Select(kv => kv.Key)
             .ToList();
 
-        response.TotalCommits = commits.Count;
-        response.ContributionPercentage = CalculateContribution(commits, contributors, request);
-
-        var (frameworks, completeness) = await DetectFrameworksAndCompletenessAsync(owner, repoName, rootContents, ct);
-        response.FrameworksDetected = frameworks;
-        response.CompletenessScore = completeness;
-
-        response.FinalScore = ComputeFinalScore(response);
-
-        try
-        {
-           // response.AiInsights = await _openAi.GetInsightsAsync(response, ct);
-
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "AI insights unavailable.");
-            response.AiInsights = string.Empty;
-        }
+        response.TotalCommits             = metrics.TotalCommits;
+        response.ContributionPercentage   = CalculateContribution(commits, contributors, studentName, email, owner);
+        response.FrameworksDetected       = frameworks;
+        response.CompletenessScore        = completenessScore;
+        response.CompletenessBreakdown    = breakdown;
+        response.FinalScore               = ComputeFinalScore(response);
 
         return response;
+    }
+
+    private static List<string> DetectFrameworks(List<GitHubContentItem> rootContents)
+    {
+        var frameworks = new List<string>();
+        var names = rootContents.Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var hasCsproj = rootContents.Any(c => c.Name.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase));
+        var hasSln    = rootContents.Any(c => c.Name.EndsWith(".sln", StringComparison.OrdinalIgnoreCase));
+        if (hasCsproj || hasSln) frameworks.Add(".NET");
+        if (names.Contains("package.json")) frameworks.Add("Node.js");
+        if (names.Contains("requirements.txt") || names.Contains("setup.py")) frameworks.Add("Python");
+        if (names.Contains("pom.xml") || names.Contains("build.gradle")) frameworks.Add("Java");
+        if (names.Contains("go.mod")) frameworks.Add("Go");
+
+        // React: indicated by presence of src/ folder alongside package.json, or common React config files
+        var hasPackageJson = names.Contains("package.json");
+        var hasReactConfig = names.Contains("src") || names.Contains(".babelrc") ||
+                             names.Contains("vite.config.js") || names.Contains("vite.config.ts") ||
+                             names.Contains("craco.config.js") || names.Contains("react.config.js");
+        if (hasPackageJson && hasReactConfig) frameworks.Add("React");
+
+        return frameworks;
     }
 
     private static double CalculateContribution(
         List<GitHubCommit> commits,
         List<GitHubContributor> contributors,
-        AnalyzeRequest request)
+        string studentName,
+        string email,
+        string username = "")
     {
         if (commits.Count == 0) return 0;
 
-        var email = request.Email?.Trim().ToLowerInvariant() ?? string.Empty;
-        var name = request.StudentName?.Trim().ToLowerInvariant() ?? string.Empty;
+        var normalizedEmail    = email?.Trim().ToLowerInvariant()    ?? string.Empty;
+        var normalizedName     = studentName?.Trim().ToLowerInvariant() ?? string.Empty;
+        var normalizedUsername = username?.Trim().ToLowerInvariant() ?? string.Empty;
 
         var studentCommits = commits.Count(c =>
         {
-            var login = c.Author?.Login?.ToLowerInvariant() ?? string.Empty;
+            var login       = c.Author?.Login?.ToLowerInvariant()        ?? string.Empty;
             var commitEmail = c.Commit?.Author?.Email?.ToLowerInvariant() ?? string.Empty;
-            var commitName = c.Commit?.Author?.Name?.ToLowerInvariant() ?? string.Empty;
+            var commitName  = c.Commit?.Author?.Name?.ToLowerInvariant()  ?? string.Empty;
 
-            return (!string.IsNullOrEmpty(email) && commitEmail == email)
-                || (!string.IsNullOrEmpty(name) && (login.Contains(name) || commitName.Contains(name)));
+            // 1. Exact GitHub username match (most reliable — login is the authenticated GitHub account)
+            if (!string.IsNullOrEmpty(normalizedUsername) && login == normalizedUsername)
+                return true;
+
+            // 2. Exact email match
+            if (!string.IsNullOrEmpty(normalizedEmail) && commitEmail == normalizedEmail)
+                return true;
+
+            // 3. Name-based fallback (least reliable — only used when username and email are both unavailable)
+            if (!string.IsNullOrEmpty(normalizedName) &&
+                (login.Contains(normalizedName) || commitName.Contains(normalizedName)))
+                return true;
+
+            return false;
         });
 
         return Math.Round(studentCommits * 100.0 / commits.Count, 2);
     }
 
-    private async Task<(List<string> Frameworks, int Completeness)> DetectFrameworksAndCompletenessAsync(
-        string owner,
-        string repoName,
-        List<GitHubContentItem> rootContents,
-        CancellationToken ct)
-    {
-        var frameworks = new List<string>();
-        var names = rootContents.Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var dirs = rootContents.Where(c => c.Type == "dir").Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        // .NET detection
-        var hasCsproj = rootContents.Any(c => c.Name.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase));
-        var hasSln = rootContents.Any(c => c.Name.EndsWith(".sln", StringComparison.OrdinalIgnoreCase));
-        if (hasCsproj || hasSln)
-            frameworks.Add(".NET");
-
-        // React detection via package.json
-        if (names.Contains("package.json"))
-        {
-            var pkg = await _gitHub.GetFileContentAsync(owner, repoName, "package.json", ct);
-            if (!string.IsNullOrEmpty(pkg) &&
-                pkg.Contains("\"react\"", StringComparison.OrdinalIgnoreCase))
-            {
-                frameworks.Add("React");
-            }
-        }
-
-        // Completeness
-        var score = 0;
-        if (names.Any(n => n.Equals("README.md", StringComparison.OrdinalIgnoreCase))) score += 40;
-        if (names.Contains("package.json") || hasCsproj || hasSln) score += 30;
-        if (dirs.Contains("src")) score += 20;
-        if (dirs.Contains("tests") || dirs.Contains("test")) score += 10;
-
-        return (frameworks, Math.Min(score, 100));
-    }
-
     private static int ComputeFinalScore(AnalyzeResponse r)
     {
-        // Contribution weight: 30%
-        var contribution = Math.Min(r.ContributionPercentage, 100) * 0.30;
+        // Completeness score: 90% weight
+        var completeness = r.CompletenessScore * 0.90;
 
-        // Tech stack bonus: 20% (full if any framework detected)
-        var techStack = r.FrameworksDetected.Count > 0 ? 20.0 : 0.0;
+        // Remaining 10% split across: contribution, tech stack, activity
+        var contribution = Math.Min(r.ContributionPercentage, 100) * 0.04;
+        var techStack    = r.FrameworksDetected.Count > 0 ? 3.0 : 0.0;
+        techStack += r.FrameworksDetected.Contains(".NET")  ? 1.0 : 0.0;   // bonus for .NET
+        techStack += r.FrameworksDetected.Contains("React") ? 1.0 : 0.0;   // bonus for React
+        techStack  = Math.Min(techStack, 5.0);                              // cap tech stack at 5
+        var activity     = Math.Min(r.TotalCommits, 100) * 0.03;
 
-        // Completeness: 20%
-        var completeness = r.CompletenessScore * 0.20;
-
-        // Activity (commits): 30% — scale 100 commits to full points
-        var activity = Math.Min(r.TotalCommits, 100) * 0.30;
-
-        var total = contribution + techStack + completeness + activity;
+        var total = completeness + contribution + techStack + activity;
         return (int)Math.Round(Math.Min(total, 100));
     }
 }
