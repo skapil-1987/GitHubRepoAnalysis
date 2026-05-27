@@ -34,6 +34,7 @@ public class OpenAIService : IOpenAIService
         var endpoint   = _configuration["AzureOpenAI:Endpoint"];
         var apiKey     = _configuration["AzureOpenAI:ApiKey"];
         var deployment = _configuration["AzureOpenAI:Deployment"];
+        var model      = _configuration["AzureOpenAI:Model"];
         var apiVersion = _configuration["AzureOpenAI:ApiVersion"] ?? "2024-10-21";
 
         if (string.IsNullOrWhiteSpace(endpoint) ||
@@ -43,47 +44,56 @@ public class OpenAIService : IOpenAIService
             return empty;
         }
 
-        // Deployment is optional — if empty, assumes Foundry serverless (Models-as-a-Service)
-        if (string.IsNullOrWhiteSpace(deployment))
+        var isServerless = string.IsNullOrWhiteSpace(deployment);
+        if (isServerless)
             _logger.LogInformation("No deployment name configured; using Foundry serverless endpoint.");
 
         var prompt = BuildBatchPrompt(repos);
 
-        var payload = new
-        {
-            messages = new[]
+        // For serverless, model name must be in the request body.
+        // For managed deployments, model is implied by the deployment name in the URL.
+        object payload = isServerless
+            ? new
             {
-                new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
-                new { role = "user",   content = prompt }
-            },
-            max_tokens  = 2000,  // CHANGED: Increased from 500 to support richer AI analysis with code review
-            temperature = 0.2
-        };
+                model = model ?? "gpt-4o-mini",
+                messages = new[]
+                {
+                    new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
+                    new { role = "user",   content = prompt }
+                },
+                max_tokens  = 2000,
+                temperature = 0.2
+            }
+            : (object)new
+            {
+                messages = new[]
+                {
+                    new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
+                    new { role = "user",   content = prompt }
+                },
+                max_tokens  = 2000,
+                temperature = 0.2
+            };
 
         var client = _httpClientFactory.CreateClient(HttpClientName);
 
-        // CHANGED: Azure AI Foundry (.services.ai.azure.com) uses a different URL format
-        // than classic Azure OpenAI (.openai.azure.com).
-        // Foundry (AI Services): {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...
-        // Classic Azure OpenAI:  {endpoint}/openai/deployments/{deployment}/chat/completions?api-version=...
-        // Foundry serverless (Models-as-a-Service): {endpoint}/models/chat/completions?api-version=2024-05-01-preview
+        // Serverless (Models-as-a-Service): {endpoint}/models/chat/completions
+        // Managed / Classic Azure OpenAI:   {endpoint}/openai/deployments/{deployment}/chat/completions
         var trimmedEndpoint = endpoint.TrimEnd('/');
-        string url;
-        if (string.IsNullOrWhiteSpace(deployment))
-        {
-            // Serverless / Models-as-a-Service — no deployment name needed
-            url = $"{trimmedEndpoint}/models/chat/completions?api-version={apiVersion}";
-        }
-        else
-        {
-            url = $"{trimmedEndpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
-        }
+        var url = isServerless
+            ? $"{trimmedEndpoint}/models/chat/completions?api-version={apiVersion}"
+            : $"{trimmedEndpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
         };
-        request.Headers.Add("api-key", apiKey);
+
+        // Serverless uses Bearer token auth; managed deployments use api-key header
+        if (isServerless)
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        else
+            request.Headers.Add("api-key", apiKey);
 
         try
         {
