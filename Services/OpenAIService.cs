@@ -33,9 +33,6 @@ public class OpenAIService : IOpenAIService
 
         var endpoint   = _configuration["AzureOpenAI:Endpoint"];
         var apiKey     = _configuration["AzureOpenAI:ApiKey"];
-        var deployment = _configuration["AzureOpenAI:Deployment"];
-        var model      = _configuration["AzureOpenAI:Model"];
-        var apiVersion = _configuration["AzureOpenAI:ApiVersion"] ?? "2024-10-21";
 
         if (string.IsNullOrWhiteSpace(endpoint) ||
             string.IsNullOrWhiteSpace(apiKey))
@@ -44,56 +41,28 @@ public class OpenAIService : IOpenAIService
             return empty;
         }
 
-        var isServerless = string.IsNullOrWhiteSpace(deployment);
-        if (isServerless)
-            _logger.LogInformation("No deployment name configured; using Foundry serverless endpoint.");
-
         var prompt = BuildBatchPrompt(repos);
 
-        // For serverless, model name must be in the request body.
-        // For managed deployments, model is implied by the deployment name in the URL.
-        object payload = isServerless
-            ? new
+        var payload = new
+        {
+            messages = new[]
             {
-                model = model ?? "gpt-4o-mini",
-                messages = new[]
-                {
-                    new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
-                    new { role = "user",   content = prompt }
-                },
-                max_tokens  = 2000,
-                temperature = 0.2
-            }
-            : (object)new
-            {
-                messages = new[]
-                {
-                    new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
-                    new { role = "user",   content = prompt }
-                },
-                max_tokens  = 2000,
-                temperature = 0.2
-            };
+                new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
+                new { role = "user",   content = prompt }
+            },
+            max_tokens  = 2000,
+            temperature = 0.2
+        };
 
         var client = _httpClientFactory.CreateClient(HttpClientName);
 
-        // Serverless (Models-as-a-Service): {endpoint}/models/chat/completions
-        // Managed / Classic Azure OpenAI:   {endpoint}/openai/deployments/{deployment}/chat/completions
-        var trimmedEndpoint = endpoint.TrimEnd('/');
-        var url = isServerless
-            ? $"{trimmedEndpoint}/models/chat/completions?api-version={apiVersion}"
-            : $"{trimmedEndpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        // Endpoint is the complete URL including deployment and api-version,
+        // e.g. https://xxx.cognitiveservices.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
         };
-
-        // Serverless uses Bearer token auth; managed deployments use api-key header
-        if (isServerless)
-            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-        else
-            request.Headers.Add("api-key", apiKey);
+        request.Headers.Add("api-key", apiKey);
 
         try
         {
