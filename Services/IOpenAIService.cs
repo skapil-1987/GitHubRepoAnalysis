@@ -13,7 +13,7 @@ public interface IOpenAIService
     /// CHANGED: Now accepts code snippets per repo so the AI can review actual code
     /// alongside aggregated metrics for a more accurate quality assessment.
     /// </summary>
-    Task<(IReadOnlyDictionary<string, int?> CodeQualityScores, string AiSummary)> GetBatchRepoInsightAsync(
+    Task<(IReadOnlyDictionary<string, int?> CodeQualityScores, IReadOnlyDictionary<string, RepoAiAnalysis> RepoAnalyses, string AiSummary)> GetBatchRepoInsightAsync(
         IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos,
         CancellationToken ct = default);
 }

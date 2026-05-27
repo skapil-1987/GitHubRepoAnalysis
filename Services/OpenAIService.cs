@@ -25,11 +25,14 @@ public class OpenAIService : IOpenAIService
     }
 
     // CHANGED: Now accepts code snippets per repo for actual code review by the AI.
-    public async Task<(IReadOnlyDictionary<string, int?> CodeQualityScores, string AiSummary)> GetBatchRepoInsightAsync(
+    public async Task<(IReadOnlyDictionary<string, int?> CodeQualityScores, IReadOnlyDictionary<string, RepoAiAnalysis> RepoAnalyses, string AiSummary)> GetBatchRepoInsightAsync(
         IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos,
         CancellationToken ct = default)
     {
-        var empty = (CodeQualityScores: (IReadOnlyDictionary<string, int?>)new Dictionary<string, int?>(), AiSummary: "AI analysis unavailable");
+        var empty = (
+            CodeQualityScores: (IReadOnlyDictionary<string, int?>)new Dictionary<string, int?>(),
+            RepoAnalyses: (IReadOnlyDictionary<string, RepoAiAnalysis>)new Dictionary<string, RepoAiAnalysis>(),
+            AiSummary: "AI analysis unavailable");
 
         var endpoint   = _configuration["AzureOpenAI:Endpoint"];
         var apiKey     = _configuration["AzureOpenAI:ApiKey"];
@@ -50,7 +53,7 @@ public class OpenAIService : IOpenAIService
                 new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
                 new { role = "user",   content = prompt }
             },
-            max_tokens  = 2000,
+            max_tokens  = 8000,
             temperature = 0.2
         };
 
@@ -82,7 +85,8 @@ public class OpenAIService : IOpenAIService
                 .GetProperty("content")
                 .GetString() ?? string.Empty;
 
-            return ParseBatchResponse(raw, repos);
+            var parsed = ParseBatchResponse(raw, repos);
+            return (parsed.CodeQualityScores, parsed.RepoAnalyses, parsed.AiSummary);
         }
         catch (Exception ex)
         {
@@ -166,19 +170,35 @@ public class OpenAIService : IOpenAIService
         }
 
         sb.AppendLine("Provide the following in a single JSON response:");
-        sb.AppendLine("1. repos: an array with a codeQualityScore (0-100) for each repository, in the same order as above.");
-        sb.AppendLine("   Base this score primarily on the ACTUAL CODE you reviewed, not just the metrics.");
-        sb.AppendLine("2. aiSummary: a concise 4-6 line summary covering:");
-        sb.AppendLine("   - Overall code quality and maturity level");
-        sb.AppendLine("   - Specific strengths observed in the code (with examples)");
-        sb.AppendLine("   - Specific areas to improve (with examples)");
-        sb.AppendLine("   - Hiring recommendation (strong/moderate/weak candidate based on code quality)");
+        sb.AppendLine();
+        sb.AppendLine("1. repos: an array with DETAILED analysis for each repository (same order as above). Each entry must include:");
+        sb.AppendLine("   - codeQualityScore (0-100): based primarily on the ACTUAL CODE you reviewed");
+        sb.AppendLine("   - strengths: array of 2-4 specific strengths with concrete examples from the code (e.g., file names, patterns observed)");
+        sb.AppendLine("   - areasToImprove: array of 2-4 specific improvements with concrete examples");
+        sb.AppendLine("   - technicalStack: one-line summary of technologies/frameworks/patterns used in this repo");
+        sb.AppendLine("   - codePatterns: one-line description of design patterns or architectural approach observed (e.g., MVC, layered, monolithic)");
+        sb.AppendLine("   - repoVerdict: one-line hiring-relevant verdict for this repo (e.g., 'Shows solid OOP fundamentals with room for error handling improvement')");
+        sb.AppendLine();
+        sb.AppendLine("2. aiSummary: a technical summary (8-12 lines) for a TECHNICAL MANAGER reviewing this candidate. Include:");
+        sb.AppendLine("   - Overall skill assessment with proficiency level (beginner/intermediate/advanced)");
+        sb.AppendLine("   - Technical strengths across all repos (languages, patterns, architecture)");
+        sb.AppendLine("   - Technical gaps or concerns (missing testing, poor error handling, no separation of concerns, etc.)");
+        sb.AppendLine("   - Code maturity indicators (comments, project structure, dependency management, git hygiene)");
+        sb.AppendLine("   - Hiring recommendation: Strong Hire / Hire / Lean Hire / No Hire — with justification");
+        sb.AppendLine("   - Suggested interview focus areas based on observed gaps");
         sb.AppendLine();
         sb.AppendLine("Return ONLY valid JSON in this exact format:");
         sb.AppendLine("{");
         sb.AppendLine("  \"repos\": [");
-        sb.AppendLine("    { \"repo\": \"<full repo name>\", \"codeQualityScore\": <number> },");
-        sb.AppendLine("    ...");
+        sb.AppendLine("    {");
+        sb.AppendLine("      \"repo\": \"<full repo name>\",");
+        sb.AppendLine("      \"codeQualityScore\": <number>,");
+        sb.AppendLine("      \"strengths\": [\"...\", \"...\"],");
+        sb.AppendLine("      \"areasToImprove\": [\"...\", \"...\"],");
+        sb.AppendLine("      \"technicalStack\": \"<string>\",");
+        sb.AppendLine("      \"codePatterns\": \"<string>\",");
+        sb.AppendLine("      \"repoVerdict\": \"<string>\"");
+        sb.AppendLine("    }");
         sb.AppendLine("  ],");
         sb.AppendLine("  \"aiSummary\": \"<string>\"");
         sb.AppendLine("}");
@@ -186,11 +206,12 @@ public class OpenAIService : IOpenAIService
         return sb.ToString();
     }
 
-    private static (IReadOnlyDictionary<string, int?> CodeQualityScores, string AiSummary) ParseBatchResponse(
+    private static (IReadOnlyDictionary<string, int?> CodeQualityScores, IReadOnlyDictionary<string, RepoAiAnalysis> RepoAnalyses, string AiSummary) ParseBatchResponse(
         string raw, IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos)
     {
-        var scores  = new Dictionary<string, int?>();
-        var summary = "AI analysis unavailable";
+        var scores   = new Dictionary<string, int?>();
+        var analyses = new Dictionary<string, RepoAiAnalysis>();
+        var summary  = "AI analysis unavailable";
 
         try
         {
@@ -202,22 +223,34 @@ public class OpenAIService : IOpenAIService
             using var doc  = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            // Parse per-repo codeQualityScore array
             if (root.TryGetProperty("repos", out var reposEl) && reposEl.ValueKind == JsonValueKind.Array)
             {
                 var repoArray = reposEl.EnumerateArray().ToList();
                 for (int i = 0; i < repoArray.Count && i < repos.Count; i++)
                 {
+                    var el = repoArray[i];
                     var repoName = repos[i].Summary.Repo;
-                    int? score   = repoArray[i].TryGetProperty("codeQualityScore", out var scoreEl)
-                                   && scoreEl.TryGetInt32(out var s)
+
+                    // Code quality score
+                    int? score = el.TryGetProperty("codeQualityScore", out var scoreEl)
+                                 && scoreEl.TryGetInt32(out var s)
                         ? Math.Clamp(s, 0, 100)
                         : null;
                     scores[repoName] = score;
+
+                    // Per-repo detailed analysis
+                    var analysis = new RepoAiAnalysis
+                    {
+                        Strengths = ParseStringArray(el, "strengths"),
+                        AreasToImprove = ParseStringArray(el, "areasToImprove"),
+                        TechnicalStack = el.TryGetProperty("technicalStack", out var ts) ? ts.GetString() ?? "" : "",
+                        CodePatterns = el.TryGetProperty("codePatterns", out var cp) ? cp.GetString() ?? "" : "",
+                        RepoVerdict = el.TryGetProperty("repoVerdict", out var rv) ? rv.GetString() ?? "" : ""
+                    };
+                    analyses[repoName] = analysis;
                 }
             }
 
-            // Parse shared aiSummary
             if (root.TryGetProperty("aiSummary", out var summaryEl))
                 summary = summaryEl.GetString() ?? summary;
         }
@@ -226,6 +259,18 @@ public class OpenAIService : IOpenAIService
             // Return whatever was parsed so far
         }
 
-        return (scores, summary);
+        return (scores, analyses, summary);
+    }
+
+    private static List<string> ParseStringArray(JsonElement el, string propertyName)
+    {
+        if (!el.TryGetProperty(propertyName, out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return new List<string>();
+
+        return arr.EnumerateArray()
+            .Where(a => a.ValueKind == JsonValueKind.String)
+            .Select(a => a.GetString() ?? "")
+            .Where(s => !string.IsNullOrEmpty(s))
+            .ToList();
     }
 }

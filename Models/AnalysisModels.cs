@@ -70,6 +70,13 @@ public class AnalyzeResponse
     [JsonPropertyName("codeQualityScore")]
     public int? CodeQualityScore { get; set; }
 
+    /// <summary>
+    /// Per-repo AI analysis with detailed technical feedback.
+    /// Populated only for top 3 repos that are sent to the LLM.
+    /// </summary>
+    [JsonPropertyName("aiAnalysis")]
+    public RepoAiAnalysis? AiAnalysis { get; set; }
+
     [JsonPropertyName("message")]
     public string? Message { get; set; }
 
@@ -134,6 +141,28 @@ public class CompletenessBreakdown
 
     [JsonPropertyName("hasMultipleLanguages")]
     public bool HasMultipleLanguages { get; set; }
+}
+
+/// <summary>
+/// Detailed AI analysis for a single repository.
+/// Returned by the LLM as part of the batch review.
+/// </summary>
+public class RepoAiAnalysis
+{
+    [JsonPropertyName("strengths")]
+    public List<string> Strengths { get; set; } = new();
+
+    [JsonPropertyName("areasToImprove")]
+    public List<string> AreasToImprove { get; set; } = new();
+
+    [JsonPropertyName("technicalStack")]
+    public string TechnicalStack { get; set; } = string.Empty;
+
+    [JsonPropertyName("codePatterns")]
+    public string CodePatterns { get; set; } = string.Empty;
+
+    [JsonPropertyName("repoVerdict")]
+    public string RepoVerdict { get; set; } = string.Empty;
 }
 
 /// <summary>

@@ -149,13 +149,16 @@ public class AnalysisService : IAnalysisService
             try
             {
                 _logger.LogInformation("Making single batch LLM call for {Count} repos", repoMetricsList.Count);
-                var (codeQualityScores, batchSummary) = await _openAi.GetBatchRepoInsightAsync(repoMetricsList, ct);
+                var (codeQualityScores, repoAnalyses, batchSummary) = await _openAi.GetBatchRepoInsightAsync(repoMetricsList, ct);
 
-                // Apply per-repo codeQualityScore from the single response
+                // Apply per-repo codeQualityScore and detailed AI analysis
                 foreach (var (repoResponse, _, _) in repoMetricsList)
                 {
                     if (codeQualityScores.TryGetValue(repoResponse.Repo, out var score))
                         repoResponse.CodeQualityScore = score;
+
+                    if (repoAnalyses.TryGetValue(repoResponse.Repo, out var analysis))
+                        repoResponse.AiAnalysis = analysis;
                 }
 
                 aiSummary = batchSummary;
