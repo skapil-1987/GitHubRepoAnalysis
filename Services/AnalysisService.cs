@@ -8,11 +8,9 @@ public class AnalysisService : IAnalysisService
 {
     private const int MaxConcurrentRepoAnalysis = 5;
 
-    private static readonly HashSet<string> CodeExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".cs", ".js", ".ts", ".py", ".java", ".go", ".rb", ".php",
-        ".cpp", ".c", ".rs", ".kt", ".swift", ".scala", ".r", ".m"
-    };
+    // CHANGED: Use shared extension list instead of a local subset.
+    // Previously had 16 extensions; now covers 50+ languages via KnownCodeExtensions.
+    private static readonly HashSet<string> CodeExtensions = KnownCodeExtensions.All;
 
     private readonly IGitHubService _gitHub;
     private readonly IOpenAIService _openAi;
@@ -113,7 +111,9 @@ public class AnalysisService : IAnalysisService
         var top3 = sortedRepos.Take(3).ToList();
         _logger.LogInformation("Collecting code metrics for top {Count} repositories for user {Username}", top3.Count, username);
 
-        var repoMetricsList = new List<(AnalyzeResponse Summary, CodeMetrics Metrics)>();
+        // CHANGED: Now carries code snippets alongside metrics so the AI can
+        // review actual code, not just aggregated counts.
+        var repoMetricsList = new List<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)>();
 
         await Task.WhenAll(top3.Select(async repoResponse =>
         {
@@ -134,7 +134,7 @@ public class AnalysisService : IAnalysisService
                     hasStructure: treeItems.Count(t => t.Type == "tree") > 0);
 
                 lock (repoMetricsList)
-                    repoMetricsList.Add((repoResponse, metrics));
+                    repoMetricsList.Add((repoResponse, metrics, codeFiles));
             }
             catch (Exception ex)
             {
@@ -152,7 +152,7 @@ public class AnalysisService : IAnalysisService
                 var (codeQualityScores, batchSummary) = await _openAi.GetBatchRepoInsightAsync(repoMetricsList, ct);
 
                 // Apply per-repo codeQualityScore from the single response
-                foreach (var (repoResponse, _) in repoMetricsList)
+                foreach (var (repoResponse, _, _) in repoMetricsList)
                 {
                     if (codeQualityScores.TryGetValue(repoResponse.Repo, out var score))
                         repoResponse.CodeQualityScore = score;
@@ -245,7 +245,12 @@ public class AnalysisService : IAnalysisService
             ContributorCount = contributors.Count,
             BranchCount      = branchCountTask.Result,
             PullRequestCount = prCountTask.Result,
-            ReleaseCount     = releaseCountTask.Result
+            ReleaseCount     = releaseCountTask.Result,
+
+            // NEW: Pass actual file and directory paths so CompletenessScoreService
+            // can accurately detect src/, test/ directories and real project files.
+            FilePaths        = treeItems.Where(t => t.Type == "blob").Select(t => t.Path).ToList(),
+            DirectoryPaths   = treeItems.Where(t => t.Type == "tree").Select(t => t.Path).ToList()
         };
 
         // Detect frameworks from root contents
@@ -331,20 +336,44 @@ public class AnalysisService : IAnalysisService
         return Math.Round(studentCommits * 100.0 / commits.Count, 2);
     }
 
+    // CHANGED: Rebalanced FinalScore formula.
+    // Previously completeness was 90% of the score, which meant a repo with
+    // a README + multiple branches but no real code could outscore a repo with
+    // substantial code. New weights:
+    //   - Completeness: 60% (project structure, README, tests, branches, etc.)
+    //   - Contribution:  15% (student's own commits — critical for fresher evaluation)
+    //   - Commit depth:  10% (rewards sustained work, not just initial push)
+    //   - Tech stack:     5% (framework detection)
+    //   - Language count: 5% (multi-language proficiency)
+    //   - Code volume:    5% (meaningful amount of code files)
     private static int ComputeFinalScore(AnalyzeResponse r)
     {
-        // Completeness score: 90% weight
-        var completeness = r.CompletenessScore * 0.90;
+        // Completeness: 60% weight (down from 90%)
+        var completeness = r.CompletenessScore * 0.60;
 
-        // Remaining 10% split across: contribution, tech stack, activity
-        var contribution = Math.Min(r.ContributionPercentage, 100) * 0.04;
-        var techStack    = r.FrameworksDetected.Count > 0 ? 3.0 : 0.0;
-        techStack += r.FrameworksDetected.Contains(".NET")  ? 1.0 : 0.0;   // bonus for .NET
-        techStack += r.FrameworksDetected.Contains("React") ? 1.0 : 0.0;   // bonus for React
-        techStack  = Math.Min(techStack, 5.0);                              // cap tech stack at 5
-        var activity     = Math.Min(r.TotalCommits, 100) * 0.03;
+        // Contribution: 15% — student's own contribution percentage
+        // For fresher hiring, we care that the student actually wrote the code.
+        var contribution = Math.Min(r.ContributionPercentage, 100) * 0.15;
 
-        var total = completeness + contribution + techStack + activity;
+        // Commit depth: 10% — rewards sustained work over time
+        // Scale: 1 commit = 0.1, 50+ commits = full 10 points
+        var commitDepth = Math.Min(r.TotalCommits, 50) * 0.20;
+        commitDepth = Math.Min(commitDepth, 10.0);
+
+        // Tech stack: 5%
+        var techStack = r.FrameworksDetected.Count > 0 ? 3.0 : 0.0;
+        techStack += r.FrameworksDetected.Contains(".NET")  ? 1.0 : 0.0;
+        techStack += r.FrameworksDetected.Contains("React") ? 1.0 : 0.0;
+        techStack  = Math.Min(techStack, 5.0);
+
+        // Language diversity: 5%
+        var langScore = Math.Min(r.Languages.Count, 3) * (5.0 / 3.0);
+
+        // Code volume: 5% — at least some meaningful code files
+        // (prevents empty/config-only repos from ranking high)
+        var codeVolume = r.Languages.Count > 0 ? 5.0 : 0.0;
+
+        var total = completeness + contribution + commitDepth + techStack + langScore + codeVolume;
         return (int)Math.Round(Math.Min(total, 100));
     }
 }

@@ -24,8 +24,10 @@ public class OpenAIService : IOpenAIService
         _logger = logger;
     }
 
+    // CHANGED: Now accepts code snippets per repo for actual code review by the AI.
     public async Task<(IReadOnlyDictionary<string, int?> CodeQualityScores, string AiSummary)> GetBatchRepoInsightAsync(
-        IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics)> repos, CancellationToken ct = default)
+        IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos,
+        CancellationToken ct = default)
     {
         var empty = (CodeQualityScores: (IReadOnlyDictionary<string, int?>)new Dictionary<string, int?>(), AiSummary: "AI analysis unavailable");
 
@@ -51,7 +53,7 @@ public class OpenAIService : IOpenAIService
                 new { role = "system", content = "You are an expert code reviewer. Always respond with valid JSON only, no markdown, no extra text." },
                 new { role = "user",   content = prompt }
             },
-            max_tokens  = 500,
+            max_tokens  = 2000,  // CHANGED: Increased from 500 to support richer AI analysis with code review
             temperature = 0.2
         };
 
@@ -91,20 +93,41 @@ public class OpenAIService : IOpenAIService
         }
     }
 
-    private static string BuildBatchPrompt(IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics)> repos)
+    // CHANGED: Prompt now includes actual code snippets from representative files
+    // so the AI can evaluate naming conventions, patterns, error handling, structure,
+    // and overall code quality — not just aggregated metric counts.
+    // Token budget: ~50-100K per student, so we can afford ~6K lines across 3 repos.
+    private static string BuildBatchPrompt(
+        IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos)
     {
+        // Cap total code lines sent to the AI to stay within token budget.
+        // ~6,000 lines ≈ ~18,000 tokens for code + ~2,000 tokens for metadata/instructions.
+        const int maxTotalCodeLines = 6000;
+        const int maxLinesPerRepo   = 2500;
+
         var sb = new StringBuilder();
-        sb.AppendLine("You are evaluating a student's top GitHub repositories.");
-        sb.AppendLine("Below are the metadata and code metrics for each repository.");
+        sb.AppendLine("You are evaluating a college fresher's top GitHub repositories for a hiring assessment.");
+        sb.AppendLine("Below are the metadata, code metrics, and ACTUAL CODE SNIPPETS for each repository.");
         sb.AppendLine("Do NOT recalculate or change completenessScore or finalScore — use them only as context.");
         sb.AppendLine();
+        sb.AppendLine("When reviewing the code, evaluate:");
+        sb.AppendLine("- Code structure and organization (classes, functions, separation of concerns)");
+        sb.AppendLine("- Naming conventions (variables, methods, classes)");
+        sb.AppendLine("- Error handling patterns (try/catch, input validation)");
+        sb.AppendLine("- Code readability and comments");
+        sb.AppendLine("- Use of language features and best practices");
+        sb.AppendLine("- Testing presence and quality (if test files are included)");
+        sb.AppendLine();
+
+        var totalLinesUsed = 0;
 
         for (int i = 0; i < repos.Count; i++)
         {
-            var (s, m) = repos[i];
+            var (s, m, codeSnippets) = repos[i];
             sb.AppendLine($"===== Repository {i + 1}: {s.Repo} =====");
             sb.AppendLine($"- Languages       : {string.Join(", ", s.Languages)}");
             sb.AppendLine($"- Total Commits   : {s.TotalCommits}");
+            sb.AppendLine($"- Contribution %  : {s.ContributionPercentage}");
             sb.AppendLine($"- Completeness    : {s.CompletenessScore}");
             sb.AppendLine($"- Final Score     : {s.FinalScore}");
             sb.AppendLine($"- Code Files      : {m.CodeFiles}  |  Total LOC : {m.TotalLinesOfCode}  |  Avg LOC/file : {m.AverageLinesPerFile}");
@@ -112,11 +135,46 @@ public class OpenAIService : IOpenAIService
             sb.AppendLine($"- Conditionals    : {m.ConditionalCount}  |  Error Handling : {m.ErrorHandlingCount}  |  Imports : {m.ImportCount}");
             sb.AppendLine($"- Comment Lines   : {m.CommentLines}  |  Folder Structure : {m.HasStructure}  |  README size : {m.ReadmeSize}");
             sb.AppendLine();
+
+            // NEW: Append actual code snippets for AI review
+            if (codeSnippets.Count > 0)
+            {
+                sb.AppendLine("--- Code Snippets ---");
+                var repoLinesUsed = 0;
+
+                foreach (var (path, content) in codeSnippets)
+                {
+                    if (totalLinesUsed >= maxTotalCodeLines || repoLinesUsed >= maxLinesPerRepo)
+                        break;
+
+                    var lines = content.Split('\n');
+                    var linesToTake = Math.Min(lines.Length,
+                        Math.Min(maxTotalCodeLines - totalLinesUsed, maxLinesPerRepo - repoLinesUsed));
+
+                    sb.AppendLine($"\n// FILE: {path}");
+                    sb.AppendLine(string.Join('\n', lines.Take(linesToTake)));
+
+                    totalLinesUsed += linesToTake;
+                    repoLinesUsed  += linesToTake;
+                }
+
+                if (repoLinesUsed >= maxLinesPerRepo)
+                    sb.AppendLine("\n// ... (remaining files truncated to stay within token budget)");
+
+                sb.AppendLine("--- End Code Snippets ---");
+            }
+
+            sb.AppendLine();
         }
 
         sb.AppendLine("Provide the following in a single JSON response:");
         sb.AppendLine("1. repos: an array with a codeQualityScore (0-100) for each repository, in the same order as above.");
-        sb.AppendLine("2. aiSummary: a concise 3-4 line summary covering overall code quality, recurring strengths, and areas to improve across all repos.");
+        sb.AppendLine("   Base this score primarily on the ACTUAL CODE you reviewed, not just the metrics.");
+        sb.AppendLine("2. aiSummary: a concise 4-6 line summary covering:");
+        sb.AppendLine("   - Overall code quality and maturity level");
+        sb.AppendLine("   - Specific strengths observed in the code (with examples)");
+        sb.AppendLine("   - Specific areas to improve (with examples)");
+        sb.AppendLine("   - Hiring recommendation (strong/moderate/weak candidate based on code quality)");
         sb.AppendLine();
         sb.AppendLine("Return ONLY valid JSON in this exact format:");
         sb.AppendLine("{");
@@ -131,7 +189,7 @@ public class OpenAIService : IOpenAIService
     }
 
     private static (IReadOnlyDictionary<string, int?> CodeQualityScores, string AiSummary) ParseBatchResponse(
-        string raw, IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics)> repos)
+        string raw, IReadOnlyList<(AnalyzeResponse Summary, CodeMetrics Metrics, List<(string Path, string Content)> CodeSnippets)> repos)
     {
         var scores  = new Dictionary<string, int?>();
         var summary = "AI analysis unavailable";

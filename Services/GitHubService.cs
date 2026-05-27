@@ -194,21 +194,31 @@ public class GitHubService : IGitHubService
         }
     }
 
-    private static readonly HashSet<string> CodeExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".cs", ".py", ".js", ".ts", ".java", ".cpp", ".html", ".css"
-    };
+    // CHANGED: Use shared extension list instead of a local subset.
+    // Previously only had 8 extensions; now covers 50+ languages college students use.
+    private static readonly HashSet<string> CodeExtensions = KnownCodeExtensions.All;
 
+    // CHANGED: Expanded exclusion list to skip generated/dependency directories
+    // that inflate file counts and pollute AI code review with non-student code.
     private static readonly string[] ExcludedPrefixes =
     {
-        "node_modules/", "bin/", "obj/", ".git/"
+        "node_modules/", "bin/", "obj/", ".git/",
+        "dist/", "build/", "out/", ".next/",
+        "vendor/", "packages/", ".nuget/",
+        "__pycache__/", ".venv/", "venv/", "env/",
+        ".idea/", ".vs/", ".vscode/",
+        "coverage/", ".gradle/", "target/"
     };
 
+    // CHANGED: Increased limits from 10 files / 250 lines to 15 files / 400 lines
+    // to leverage the 50-100K token budget per student.
+    // NEW: Smart file selection prioritises entry points, largest code files,
+    // and test files — so the AI sees the most representative code, not random files.
     public async Task<List<(string Path, string Content)>> GetCodeFilesAsync(
         string owner, string repo, string branch, CancellationToken ct = default)
     {
-        const int maxFiles        = 10;
-        const int maxLinesPerFile = 250;
+        const int maxFiles        = 15;
+        const int maxLinesPerFile = 400;
 
         var result = new List<(string, string)>();
 
@@ -217,15 +227,17 @@ public class GitHubService : IGitHubService
             var tree = await GetFileTreeAsync(owner, repo, branch, ct);
             if (tree is null) return result;
 
-            var candidates = tree.Tree
+            var allCodeFiles = tree.Tree
                 .Where(item =>
                     item.Type == "blob" &&
                     CodeExtensions.Contains(Path.GetExtension(item.Path)) &&
                     !ExcludedPrefixes.Any(p => item.Path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
-                .Take(maxFiles)
                 .ToList();
 
-            foreach (var item in candidates)
+            // Smart selection: pick the most representative files for AI review
+            var selected = SelectRepresentativeFiles(allCodeFiles, maxFiles);
+
+            foreach (var item in selected)
             {
                 try
                 {
@@ -252,5 +264,61 @@ public class GitHubService : IGitHubService
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Selects the most representative files from a repo for AI code review.
+    /// Priority order:
+    ///   1. Entry point files (Program.cs, main.py, index.js, etc.) — shows how the app starts
+    ///   2. Test files — shows testing discipline
+    ///   3. Largest code files — contain the most logic and patterns
+    /// This ensures the AI sees meaningful code even from repos with hundreds of files.
+    /// </summary>
+    private static List<GitHubTreeItem> SelectRepresentativeFiles(List<GitHubTreeItem> allFiles, int maxFiles)
+    {
+        var selected = new List<GitHubTreeItem>();
+        var usedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // 1. Entry points — these show how the application is structured
+        var entryPointNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "program.cs", "startup.cs", "main.py", "app.py", "manage.py",
+            "index.js", "index.ts", "app.js", "app.ts", "app.tsx",
+            "main.go", "main.java", "main.rs", "main.cpp", "main.c"
+        };
+
+        foreach (var file in allFiles.Where(f =>
+            entryPointNames.Contains(Path.GetFileName(f.Path))))
+        {
+            if (selected.Count >= maxFiles) break;
+            if (usedPaths.Add(file.Path))
+                selected.Add(file);
+        }
+
+        // 2. Test files — shows whether the student writes tests
+        var testSegments = new[] { "test", "tests", "__tests__", "spec", "specs" };
+        foreach (var file in allFiles.Where(f =>
+            testSegments.Any(seg => f.Path.Split('/').Any(part =>
+                part.Equals(seg, StringComparison.OrdinalIgnoreCase))) ||
+            Path.GetFileNameWithoutExtension(f.Path).EndsWith("Test", StringComparison.OrdinalIgnoreCase) ||
+            Path.GetFileNameWithoutExtension(f.Path).EndsWith("Tests", StringComparison.OrdinalIgnoreCase) ||
+            Path.GetFileNameWithoutExtension(f.Path).EndsWith("Spec", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (selected.Count >= Math.Min(maxFiles, selected.Count + 3)) break; // max 3 test files
+            if (usedPaths.Add(file.Path))
+                selected.Add(file);
+        }
+
+        // 3. Largest code files (by size from tree) — contain the most logic
+        foreach (var file in allFiles
+            .Where(f => !usedPaths.Contains(f.Path))
+            .OrderByDescending(f => f.Size ?? 0))
+        {
+            if (selected.Count >= maxFiles) break;
+            if (usedPaths.Add(file.Path))
+                selected.Add(file);
+        }
+
+        return selected;
     }
 }

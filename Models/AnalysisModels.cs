@@ -95,6 +95,12 @@ public class RepoMetrics
     public int PullRequestCount { get; set; }
     public int ReleaseCount { get; set; }
     public bool IsFork { get; set; }
+
+    // NEW: Carry actual file/directory paths so CompletenessScoreService can
+    // accurately detect src/, test/ directories and real project files
+    // instead of relying on generic FileCount > 0 checks.
+    public List<string> FilePaths { get; set; } = new();
+    public List<string> DirectoryPaths { get; set; } = new();
 }
 
 public class CompletenessBreakdown
@@ -128,6 +134,71 @@ public class CompletenessBreakdown
 
     [JsonPropertyName("hasMultipleLanguages")]
     public bool HasMultipleLanguages { get; set; }
+}
+
+/// <summary>
+/// Single source of truth for code file extensions.
+/// Shared by GitHubService (file fetching) and AnalysisService (code file counting)
+/// to ensure consistency. Covers languages commonly used by college freshers.
+/// </summary>
+public static class KnownCodeExtensions
+{
+    public static readonly HashSet<string> All = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // C-family
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+
+        // .NET
+        ".cs", ".fs", ".vb",
+
+        // Java / JVM
+        ".java", ".kt", ".kts", ".scala", ".groovy",
+
+        // Python
+        ".py", ".pyw", ".ipynb",
+
+        // JavaScript / TypeScript / React / Vue
+        ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+
+        // Web
+        ".html", ".htm", ".css", ".scss", ".sass", ".less",
+
+        // Ruby
+        ".rb", ".erb",
+
+        // PHP
+        ".php",
+
+        // Go
+        ".go",
+
+        // Rust
+        ".rs",
+
+        // Swift / Objective-C
+        ".swift", ".m", ".mm",
+
+        // Dart (Flutter)
+        ".dart",
+
+        // R / MATLAB
+        ".r", ".R", ".mat", ".m",
+
+        // Shell / scripting
+        ".sh", ".bash", ".ps1", ".bat",
+
+        // Functional
+        ".hs", ".ex", ".exs", ".erl", ".clj",
+
+        // Lua / Perl
+        ".lua", ".pl", ".pm",
+
+        // SQL
+        ".sql",
+
+        // Markup used as code (templates)
+        ".xml", ".xaml", ".json", ".yaml", ".yml", ".toml"
+    };
 }
 
 public class CodeMetrics
