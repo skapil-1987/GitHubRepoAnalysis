@@ -39,5 +39,7 @@ builder.Services.AddSingleton<IOpenAIService, OpenAIService>();
 builder.Services.AddSingleton<ICompletenessScoreService, CompletenessScoreService>();
 builder.Services.AddSingleton<ICodeMetricsService, CodeMetricsService>();
 builder.Services.AddSingleton<IAnalysisService, AnalysisService>();
+builder.Services.AddSingleton<IExcelExportService, ExcelExportService>();
+builder.Services.AddSingleton<IExcelImportService, ExcelImportService>();
 
 builder.Build().Run();
