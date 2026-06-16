@@ -36,9 +36,12 @@ public class OpenAIService : IOpenAIService
 
         var endpoint   = _configuration["AzureOpenAI:Endpoint"];
         var apiKey     = _configuration["AzureOpenAI:ApiKey"];
+        var deployment = _configuration["AzureOpenAI:Deployment"];
+        var apiVersion = _configuration["AzureOpenAI:ApiVersion"] ?? "2025-01-01-preview";
 
         if (string.IsNullOrWhiteSpace(endpoint) ||
-            string.IsNullOrWhiteSpace(apiKey))
+            string.IsNullOrWhiteSpace(apiKey) ||
+            string.IsNullOrWhiteSpace(deployment))
         {
             _logger.LogInformation("Azure OpenAI not configured; skipping batch AI insights.");
             return empty;
@@ -59,9 +62,10 @@ public class OpenAIService : IOpenAIService
 
         var client = _httpClientFactory.CreateClient(HttpClientName);
 
-        // Endpoint is the complete URL including deployment and api-version,
-        // e.g. https://xxx.cognitiveservices.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview
-        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        // Build URL from config: {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}
+        var url = $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/chat/completions?api-version={apiVersion}";
+        _logger.LogInformation("Calling Azure OpenAI endpoint: {Url}", url);
+        using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
         };

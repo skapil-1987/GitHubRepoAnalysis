@@ -71,6 +71,16 @@ public class AnalysisService : IAnalysisService
 
         _logger.LogInformation("Analyzing {Count} repositories for user {Username}", repos.Count, username);
 
+        // CHANGED: Fully ignore forked repos — don't waste GitHub API calls analyzing them.
+        // Previously forks were analyzed (fetching commits, languages, etc.) only to be
+        // rejected with FinalScore=0 inside AnalyzeRepoAsync. Now they're filtered out
+        // before any per-repo API calls are made.
+        var originalCount = repos.Count;
+        repos = repos.Where(r => !r.Fork).ToList();
+        var forkedCount = originalCount - repos.Count;
+        if (forkedCount > 0)
+            _logger.LogInformation("Skipped {ForkedCount} forked repositories for user {Username}", forkedCount, username);
+
         var semaphore = new SemaphoreSlim(MaxConcurrentRepoAnalysis);
         var results = new ConcurrentBag<AnalyzeResponse>();
         var failureCount = 0;
@@ -170,15 +180,18 @@ public class AnalysisService : IAnalysisService
             }
         }
 
+        // CHANGED: Return only the top 3 repos (the ones sent to AI) in the response.
+        // Previously all analyzed repos were returned, which could be dozens of rows.
+        // For hiring review, the manager only needs the best 3 repos with AI analysis.
         return new AnalyzeUserResponse
         {
             StudentName    = request.StudentName,
             GithubUsername = username,
-            TotalRepos     = repos.Count,
+            TotalRepos     = originalCount,
             SuccessCount   = results.Count,
-            FailureCount   = failureCount,
+            FailureCount   = failureCount + forkedCount,
             AiSummary      = aiSummary,
-            Repositories   = sortedRepos
+            Repositories   = top3
         };
     }
 
@@ -201,12 +214,7 @@ public class AnalysisService : IAnalysisService
             IsFork = repo.Fork
         };
 
-        if (repo.Fork)
-        {
-            response.Message = "Repository is a fork. Rejected: original work is mandatory.";
-            response.FinalScore = 0;
-            return response;
-        }
+        // Forks are pre-filtered in AnalyzeUserAsync — this method only receives non-fork repos.
 
         // Fetch all data in parallel
         var languagesTask      = _gitHub.GetLanguagesAsync(owner, repoName, ct);
